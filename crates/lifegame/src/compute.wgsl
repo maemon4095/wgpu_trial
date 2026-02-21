@@ -9,7 +9,7 @@
 fn main(@builtin(global_invocation_id) id: vec3u) {
   let size = textureDimensions(input_texture);
   
-  let t0 = textureLoad(input_texture, id.xy).r; // textureLoad(input_texture, (id.xy + size + vec2u( 0,  0)) % size);
+  let t0 = textureLoad(input_texture, id.xy).r;
   let t1 = textureLoad(input_texture, (id.xy + vec2u(size.x + 0, size.y + 1)) % size).r;
   let t2 = textureLoad(input_texture, (id.xy + vec2u(size.x + 0, size.y - 1)) % size).r;
   let t3 = textureLoad(input_texture, (id.xy + vec2u(size.x - 1, size.y + 0)) % size).r;

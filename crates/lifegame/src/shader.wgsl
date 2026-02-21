@@ -14,18 +14,19 @@ fn main_vs(
 ) -> VertexOutput {
     var out: VertexOutput;
     out.uv = model.uv;
-    out.clip_position = vec4<f32>(model.position, 1.0);
+    out.clip_position = vec4f(model.position, 1.0);
     return out;
 }
 
 // Fragment shader
 
 @group(0) @binding(0)
-var tex: texture_2d<f32>;
+var tex: texture_2d<u32>;
 @group(0) @binding(1)
 var s: sampler;
 
 @fragment
-fn main_fs(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(tex, s, in.uv);
+fn main_fs(in: VertexOutput) -> @location(0) vec4f {
+  let c = f32(textureGather(0, tex, s, in.uv).r);
+  return vec4f(c, c, c, 1f);
 }

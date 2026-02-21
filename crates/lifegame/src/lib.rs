@@ -27,6 +27,7 @@ pub struct State {
     num_indices: u32,
     frame_num: usize,
     world_size: wgpu::Extent3d,
+
     window: Arc<Window>,
 }
 impl State {
@@ -92,7 +93,7 @@ impl State {
 
         // buffer for simulation parameters uniform
 
-        let sim_param_data: Vec<u32> = [0].to_vec();
+        let sim_param_data: Vec<u32> = [0b0000_0000_0000_0000].to_vec();
         let sim_param_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Simulation Parameter Buffer"),
             contents: bytemuck::cast_slice(&sim_param_data),
@@ -193,7 +194,7 @@ impl State {
         let mut compute_bind_groups = Vec::<wgpu::BindGroup>::new();
         let mut render_bind_groups = Vec::<wgpu::BindGroup>::new();
 
-        for i in 0..2 {
+        for _ in 0..2 {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("output text"),
                 size: world_size,
@@ -268,18 +269,7 @@ impl State {
                 module: &draw_shader,
                 entry_point: Some("main_vs"),
                 compilation_options: Default::default(),
-                buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: 4 * 4,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
-                    },
-                    wgpu::VertexBufferLayout {
-                        array_stride: 2 * 4,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![2 => Float32x2],
-                    },
-                ],
+                buffers: &[Vertex::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &draw_shader,
@@ -346,13 +336,11 @@ impl State {
             return Ok(());
         }
 
-        let surface_texture = self.surface.get_current_texture()?;
+        let output = self.surface.get_current_texture()?;
 
-        let view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor {
-                ..Default::default()
-            });
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor {
+            ..Default::default()
+        });
 
         let output_size = view.texture().size();
 
@@ -379,7 +367,7 @@ impl State {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        command_encoder.push_debug_group("compute boid movement");
+        command_encoder.push_debug_group("compute");
         {
             // compute pass
             let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -392,7 +380,7 @@ impl State {
         }
         command_encoder.pop_debug_group();
 
-        command_encoder.push_debug_group("render boids");
+        command_encoder.push_debug_group("render");
         {
             // render pass
             let mut rpass = command_encoder.begin_render_pass(&render_pass_descriptor);
@@ -408,8 +396,8 @@ impl State {
         self.frame_num += 1;
 
         // done
-        self.queue.submit(Some(command_encoder.finish()));
-
+        self.queue.submit([command_encoder.finish()]);
+        output.present();
         Ok(())
     }
 }
@@ -489,51 +477,31 @@ impl Vertex {
         }
     }
 }
-
+/// (-1.0, 1.0)   (1.0, 1.0)
+///      A ---------- C
+///      |            |
+///      B ---------- D
+/// (-1.0, -1.0)  (1.0, -1.0)
 const VERTICES: &[Vertex] = &[
     Vertex {
-        position: [-1.0, 1.0, 0.0],
+        position: [-1.0, 1.0, 0.0], // A
         uv: [0.0, 0.0],
     },
     Vertex {
-        position: [-1.0, -1.0, 0.0],
+        position: [-1.0, -1.0, 0.0], // B
         uv: [0.0, 1.0],
     },
     Vertex {
-        position: [1.0, 1.0, 0.0],
-        uv: [1.0, 0.0],
+        position: [1.0, 1.0, 0.0], // C
+        uv: [1.0, 1.0],
     },
     Vertex {
-        position: [1.0, -1.0, 0.0],
+        position: [1.0, -1.0, 0.0], // D
         uv: [1.0, 1.0],
     },
 ];
 
-const INDICES: &[u16] = &[0, 1, 2, 0, 2, 3];
-
-struct Metrics {
-    label: &'static str,
-    start: Instant,
-}
-
-impl Metrics {
-    pub fn start(label: &'static str) -> Self {
-        log::info!("start {}", label);
-
-        Self {
-            label,
-            start: Instant::now(),
-        }
-    }
-
-    pub fn done(self) {}
-}
-
-impl Drop for Metrics {
-    fn drop(&mut self) {
-        let end = Instant::now();
-        let elapsed = end - self.start;
-
-        log::info!("end {}. elapsed: {}ms", self.label, elapsed.as_millis());
-    }
-}
+const INDICES: &[u16] = &[
+    0, 1, 2, // A B C
+    1, 3, 2, // B D C
+];
