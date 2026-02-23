@@ -1,12 +1,28 @@
 use bytemuck::{Pod, Zeroable};
+use encase::ShaderSize;
 use std::{
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
-use wgpu::{util::DeviceExt, wgt::TextureViewDescriptor, BufferUsages, Extent3d, SurfaceError};
+use wgpu::{util::DeviceExt, SurfaceError};
 use winit::{
-    application::ApplicationHandler, event::*, event_loop::ActiveEventLoop, window::Window,
+    application::ApplicationHandler,
+    event::*,
+    event_loop::ActiveEventLoop,
+    keyboard::{KeyCode, PhysicalKey},
+    window::Window,
 };
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, encase::ShaderType)]
+struct Params {
+    world_size: glam::u32::UVec2,
+    // https://conwaylife.com/wiki/Rule_integer
+    rule: u32,
+}
 
 // https://github.com/gfx-rs/wgpu/blob/v27/examples/features/src/boids/mod.rs
 pub struct State {
@@ -17,19 +33,24 @@ pub struct State {
     is_surface_configured: bool,
     render_pipeline: wgpu::RenderPipeline,
     compute_pipeline: wgpu::ComputePipeline,
-    compute_textures: Vec<wgpu::Texture>,
-    compute_texture_views: Vec<wgpu::TextureView>,
+    compute_buffers: Vec<wgpu::Buffer>,
     compute_bind_groups: Vec<wgpu::BindGroup>,
-    compute_texture_sampler: wgpu::Sampler,
-    render_bind_groups: Vec<wgpu::BindGroup>,
+    render_bind_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
     frame_num: usize,
-    world_size: wgpu::Extent3d,
-
+    current_buffer_index: usize,
+    params: Params,
     window: Arc<Window>,
+    update_delay: Arc<AtomicU64>,
+    update_loop_handle: std::thread::JoinHandle<()>,
+    mouse_pos_x: u32,
+    mouse_pos_y: u32,
 }
+
+const PARKING_FLAG: u64 = 1 << (u64::BITS - 1);
+
 impl State {
     pub async fn new(window: Arc<Window>) -> Result<Self, Box<dyn std::error::Error>> {
         let size = window.inner_size();
@@ -85,18 +106,21 @@ impl State {
         let compute_shader = device.create_shader_module(wgpu::include_wgsl!("compute.wgsl"));
         let draw_shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-        let world_size = Extent3d {
-            width: 128,
-            height: 128,
-            depth_or_array_layers: 1,
-        };
-
         // buffer for simulation parameters uniform
 
-        let sim_param_data: Vec<u32> = [0b0000_0000_0000_0000].to_vec();
+        let params: Params = Params {
+            world_size: glam::UVec2::new(64, 64),
+            rule: (1 << 3) | (((1 << 2) | (1 << 3)) << 8),
+            // rule: 0xFF_00,
+        };
+
+        let mut buf = encase::UniformBuffer::new(Vec::<u8>::new());
+        buf.write(&params)?;
+        let buf = buf.into_inner();
+
         let sim_param_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Simulation Parameter Buffer"),
-            contents: bytemuck::cast_slice(&sim_param_data),
+            contents: &buf,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -111,29 +135,31 @@ impl State {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(
-                                (sim_param_data.len() * size_of::<u32>()) as _,
-                            ),
+                            min_binding_size: wgpu::BufferSize::new(Params::SHADER_SIZE.into()),
                         },
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::ReadOnly,
-                            format: wgpu::TextureFormat::Rgba8Uint,
-                            view_dimension: wgpu::TextureViewDimension::D2,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(
+                                (4 * params.world_size.x * params.world_size.y) as _,
+                            ),
                         },
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba8Uint,
-                            view_dimension: wgpu::TextureViewDimension::D2,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(
+                                (4 * params.world_size.x * params.world_size.y) as _,
+                            ),
                         },
                         count: None,
                     },
@@ -143,25 +169,17 @@ impl State {
 
         let render_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Uint,
-                        },
-                        count: None,
+                label: Some("render bind group layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: Params::SHADER_SIZE.into(),
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                        count: None,
-                    },
-                ],
-                label: Some("render_bind_group_layout"),
+                    count: None,
+                }],
             });
 
         let compute_pipeline_layout =
@@ -180,36 +198,21 @@ impl State {
             cache: None,
         });
 
-        let compute_texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let mut compute_textures = Vec::<wgpu::Texture>::new();
-        let mut compute_texture_views = Vec::<wgpu::TextureView>::new();
+        let mut compute_buffers = Vec::<wgpu::Buffer>::new();
         let mut compute_bind_groups = Vec::<wgpu::BindGroup>::new();
-        let mut render_bind_groups = Vec::<wgpu::BindGroup>::new();
 
         for _ in 0..2 {
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("output text"),
-                size: world_size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Uint,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::STORAGE_BINDING,
-                view_formats: &[],
+            let buffer = device.create_buffer(&wgpu::wgt::BufferDescriptor {
+                label: Some("compute buffer"),
+                size: (4 * params.world_size.x * params.world_size.y) as _,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
             });
 
-            compute_texture_views.push(texture.create_view(&TextureViewDescriptor::default()));
-            compute_textures.push(texture);
+            compute_buffers.push(buffer);
         }
 
         // create two bind groups, one for each buffer as the src
@@ -225,35 +228,25 @@ impl State {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&compute_texture_views[i]),
+                        resource: compute_buffers[i].as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(
-                            &compute_texture_views[(i + 1) % 2],
-                        ),
+                        resource: compute_buffers[(i + 1) % 2].as_entire_binding(),
                     },
                 ],
                 label: None,
             }));
-
-            render_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &render_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(
-                            &compute_texture_views[(i + 1) % 2],
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&compute_texture_sampler),
-                    },
-                ],
-                label: Some("render_bind_group"),
-            }));
         }
+
+        let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("render bind group"),
+            layout: &render_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: sim_param_buffer.as_entire_binding(),
+            }],
+        });
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -269,7 +262,14 @@ impl State {
                 module: &draw_shader,
                 entry_point: Some("main_vs"),
                 compilation_options: Default::default(),
-                buffers: &[Vertex::desc()],
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<u32>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![0 => Uint32],
+                    },
+                    Vertex::desc(),
+                ],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &draw_shader,
@@ -284,8 +284,6 @@ impl State {
             cache: None,
         });
 
-        // buffer for the three 2d triangle vertices of each instance
-
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::cast_slice(VERTICES),
@@ -299,6 +297,24 @@ impl State {
         });
         let num_indices = INDICES.len() as u32;
 
+        let update_delay = Arc::new(AtomicU64::new(50));
+        let update_loop_handle = std::thread::spawn({
+            let update_delay = Arc::clone(&update_delay);
+            let window = Arc::clone(&window);
+            move || loop {
+                let delay = update_delay.load(std::sync::atomic::Ordering::Acquire);
+                if delay == 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(delay & !PARKING_FLAG));
+                if (delay & PARKING_FLAG) != 0 {
+                    continue;
+                }
+
+                window.request_redraw();
+            }
+        });
+
         Ok(Self {
             surface,
             device,
@@ -307,18 +323,25 @@ impl State {
             is_surface_configured: false,
             compute_pipeline,
             compute_bind_groups,
-            compute_textures,
-            compute_texture_views,
-            compute_texture_sampler,
-            render_bind_groups,
+            compute_buffers,
+            render_bind_group,
             render_pipeline,
             vertex_buffer,
             index_buffer,
             num_indices,
             frame_num: 0,
+            current_buffer_index: 0,
             window,
-            world_size,
+            params,
+            update_delay,
+            update_loop_handle,
+            mouse_pos_x: 0,
+            mouse_pos_y: 0,
         })
+    }
+
+    fn need_update(&self) -> bool {
+        (self.update_delay.load(Ordering::Relaxed) & PARKING_FLAG) == 0
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -328,23 +351,48 @@ impl State {
             self.surface.configure(&self.device, &self.config);
             self.is_surface_configured = true;
         }
-    }
-    pub fn render(&mut self) -> Result<(), SurfaceError> {
-        self.window.request_redraw();
 
+        self.window.request_redraw();
+    }
+
+    pub fn update(&mut self) -> Result<(), SurfaceError> {
+        println!("update");
+        let mut command_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        command_encoder.push_debug_group("compute");
+        {
+            let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.compute_pipeline);
+            cpass.set_bind_group(0, &self.compute_bind_groups[self.current_buffer_index], &[]);
+            cpass.dispatch_workgroups(self.params.world_size.x, self.params.world_size.y, 1);
+        }
+        command_encoder.pop_debug_group();
+        self.queue.submit([command_encoder.finish()]);
+
+        self.current_buffer_index = (self.current_buffer_index + 1) % 2;
+
+        Ok(())
+    }
+
+    pub fn render(&mut self) -> Result<(), SurfaceError> {
+        println!("before render");
         if !self.is_surface_configured {
             return Ok(());
         }
 
+        if self.need_update() {
+            self.update()?;
+        }
+
         let output = self.surface.get_current_texture()?;
 
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor {
-            ..Default::default()
-        });
+        let view = output.texture.create_view(&Default::default());
 
-        let output_size = view.texture().size();
-
-        // create render pass descriptor and its color attachments
         let color_attachments = [Some(wgpu::RenderPassColorAttachment {
             view: &view,
             depth_slice: None,
@@ -362,42 +410,33 @@ impl State {
             occlusion_query_set: None,
         };
 
-        // get command encoder
         let mut command_encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-        command_encoder.push_debug_group("compute");
-        {
-            // compute pass
-            let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.compute_pipeline);
-            cpass.set_bind_group(0, &self.compute_bind_groups[self.frame_num % 2], &[]);
-            cpass.dispatch_workgroups(output_size.width, output_size.height, 1);
-        }
-        command_encoder.pop_debug_group();
 
         command_encoder.push_debug_group("render");
         {
             // render pass
             let mut rpass = command_encoder.begin_render_pass(&render_pass_descriptor);
             rpass.set_pipeline(&self.render_pipeline);
-            rpass.set_bind_group(0, &self.render_bind_groups[self.frame_num % 2], &[]);
-            rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            rpass.set_bind_group(0, &self.render_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.compute_buffers[self.current_buffer_index].slice(..));
+            rpass.set_vertex_buffer(1, self.vertex_buffer.slice(..));
             rpass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            rpass.draw_indexed(0..self.num_indices, 0, 0..1);
+            rpass.draw_indexed(
+                0..self.num_indices,
+                0,
+                0..(self.params.world_size.x * self.params.world_size.y),
+            );
         }
         command_encoder.pop_debug_group();
 
-        // update frame count
         self.frame_num += 1;
 
-        // done
         self.queue.submit([command_encoder.finish()]);
         output.present();
+
+        println!("after render");
         Ok(())
     }
 }
@@ -414,8 +453,14 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        println!("resumed");
         #[allow(unused_mut)]
         let mut window_attributes = Window::default_attributes();
+
+        if let Some(state) = self.state.take() {
+            state.update_delay.store(0, Ordering::Release);
+            state.update_loop_handle.join().unwrap();
+        }
 
         let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
 
@@ -446,6 +491,68 @@ impl ApplicationHandler for App {
                     log::error!("unable to render {}", e)
                 }
             },
+            WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+
+                match code {
+                    KeyCode::Space => {
+                        let old = state
+                            .update_delay
+                            .fetch_xor(PARKING_FLAG, Ordering::Release);
+
+                        let paused = (old & PARKING_FLAG) == 0;
+
+                        let title = if paused { "paused" } else { "running" };
+                        state.window.set_title(title);
+                    }
+                    _ => {}
+                }
+            }
+
+            WindowEvent::MouseInput {
+                state: s, button, ..
+            } if s.is_pressed() => match button {
+                MouseButton::Left => {
+                    let delay = state.update_delay.load(Ordering::Acquire);
+                    let paused = (delay & PARKING_FLAG) != 0;
+                    println!("pressed {:?}", button);
+                    if !paused {
+                        return;
+                    }
+
+                    let queue = &state.queue;
+
+                    let buffer = &state.compute_buffers[state.current_buffer_index];
+
+                    let size = state.window.inner_size();
+                    let world_size = state.params.world_size;
+
+                    let cell_w = size.width as f64 / world_size.x as f64;
+                    let cell_h = size.height as f64 / world_size.y as f64;
+
+                    let cell_x = (state.mouse_pos_x as f64 / cell_w) as u32;
+                    let cell_y = world_size.y - (state.mouse_pos_y as f64 / cell_h) as u32;
+                    let offset = (cell_x + cell_y * world_size.x) as u64 * 4;
+
+                    println!("update cell ({}, {})", cell_x, cell_y);
+
+                    queue.write_buffer(buffer, offset, bytemuck::bytes_of(&1));
+                    queue.submit([]);
+
+                    state.window.request_redraw();
+                }
+                _ => {}
+            },
+            WindowEvent::CursorMoved { position, .. } => {
+                let posx = position.x as u32;
+                let posy = position.y as u32;
+
+                state.mouse_pos_x = posx;
+                state.mouse_pos_y = posy;
+            }
+
             _ => {}
         }
     }
@@ -454,50 +561,38 @@ impl ApplicationHandler for App {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Vertex {
-    position: [f32; 3],
-    uv: [f32; 2],
+    position: [f32; 2],
 }
 impl Vertex {
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-            ],
+            attributes: &[wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x2,
+            }],
         }
     }
 }
-/// (-1.0, 1.0)   (1.0, 1.0)
-///      A ---------- C
-///      |            |
-///      B ---------- D
-/// (-1.0, -1.0)  (1.0, -1.0)
+/// (0, 0)       (1, 0)
+///   A ---------- C
+///   |            |
+///   B ---------- D
+/// (0, 1)       (1, 1)
 const VERTICES: &[Vertex] = &[
     Vertex {
-        position: [-1.0, 1.0, 0.0], // A
-        uv: [0.0, 0.0],
+        position: [0.0, 0.0], // A
     },
     Vertex {
-        position: [-1.0, -1.0, 0.0], // B
-        uv: [0.0, 1.0],
+        position: [0.0, 1.0], // B
     },
     Vertex {
-        position: [1.0, 1.0, 0.0], // C
-        uv: [1.0, 1.0],
+        position: [1.0, 0.0], // C
     },
     Vertex {
-        position: [1.0, -1.0, 0.0], // D
-        uv: [1.0, 1.0],
+        position: [1.0, 1.0], // D
     },
 ];
 

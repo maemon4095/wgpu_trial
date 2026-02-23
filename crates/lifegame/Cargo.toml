@@ -16,3 +16,8 @@ winit = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 pollster = { workspace = true }
+cgmath = { workspace = true }
+glam = { workspace = true, features = [
+  "encase",
+] }
+encase = { workspace = true }
